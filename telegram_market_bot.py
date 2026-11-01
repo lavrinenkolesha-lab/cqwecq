@@ -1,17 +1,14 @@
 #!/usr/bin/env python3
 """
-Cerberus Games Market Bot - Ultra-Fast HTTP/2 Edition + Characters Scanner
-===========================================================================
+Cerberus Games Market Bot - Ultra-Fast HTTP/2 Edition + 2FA Loop Fix
+=====================================================================
 Высокоскоростной Telegram-снайпер и монитор аукциона cerberus-games.com.
 
-Ключевые возможности:
-1. Мониторинг предметов (https://cerberus-games.com/market).
-2. Мониторинг биржи персонажей (https://cerberus-games.com/market/characters).
-3. HTTP/2 Мультиплексирование (httpx + h2): время ответа ~350-450 мс.
-4. Ультрабыстрый Fast-Check (0.1 мс): regex-проверка ID без тяжелого DOM-парсинга.
-5. Защита от Tarpit-замедлений ServicePipe с адаптивным backoff.
-6. Фильтры: вещи Тип C >= 40 ур., выгода от 500 CS, персонажи по уровню/классу/цене.
-7. Интерактивные кнопки Telegram (покупка в 1 клик, просмотр карточки на сайте).
+Исправление бесконечного редиректа 502 Bad Gateway (/login/two-step):
+1. Отключен слепой редирект: бот отслеживает перенаправления безопасно (макс 3 шага).
+2. Обнаружение 2FA (Двухфакторная аутентификация): если сервер просит 2FA, бот не падает
+   в бесконечный цикл 502, а уведомляет о необходимости куки xf_tfa_trust.
+3. Полная поддержка куки xf_tfa_trust (доверенное устройство).
 """
 
 import os
@@ -39,8 +36,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("CerberusSpeedBot")
 
-BOT_CONFIG_FILE = "tg_bot_config.json"
-
 DEFAULT_TG_CONFIG = {
     "telegram": {
         "bot_token": "YOUR_BOT_TOKEN_FROM_BOTFATHER",
@@ -55,6 +50,7 @@ DEFAULT_TG_CONFIG = {
         "cookies": {
             "xf_user": "",
             "xf_session": "",
+            "xf_tfa_trust": "",
             "cerberus_session": ""
         },
         "headers": {
@@ -87,8 +83,13 @@ DEFAULT_TG_CONFIG = {
 }
 
 
+def get_persistent_config_path() -> str:
+    if os.path.isdir("/app/data"):
+        return "/app/data/tg_bot_config.json"
+    return "tg_bot_config.json"
+
+
 class HealthCheckHandler(BaseHTTPRequestHandler):
-    """Легковесный HTTP-сервер для поддержки Render/Bothost."""
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
@@ -110,14 +111,14 @@ def start_http_health_server():
 
 
 class FastTelegramMarketBot:
-    def __init__(self, config_path: str = BOT_CONFIG_FILE):
-        self.config_path = config_path
+    def __init__(self):
+        self.config_path = get_persistent_config_path()
+        logger.info(f"Используемый файл конфигурации: {self.config_path}")
         self.config = self._load_config()
         self.token = self.config["telegram"]["bot_token"]
         self.api_url = f"https://api.telegram.org/bot{self.token}"
         self.last_update_id = 0
 
-        # Инициализация HTTP/2 клиента
         self.client = self._init_http2_client()
 
         self.running = True
@@ -135,34 +136,67 @@ class FastTelegramMarketBot:
         }
         self.last_top_item_id: Optional[str] = None
         self.last_items_hash: Optional[int] = None
-
         self.last_top_char_id: Optional[str] = None
         self.last_chars_hash: Optional[int] = None
 
         self.seen_lots = set()
         self.seen_chars = set()
+        self.warned_2fa = False
 
     def _load_config(self) -> Dict[str, Any]:
-        if not os.path.exists(self.config_path):
-            with open(self.config_path, "w", encoding="utf-8") as f:
-                json.dump(DEFAULT_TG_CONFIG, f, indent=2, ensure_ascii=False)
-            return DEFAULT_TG_CONFIG
+        cfg = None
+        if os.path.exists(self.config_path):
+            try:
+                with open(self.config_path, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+            except Exception as e:
+                logger.warning(f"Не удалось прочитать {self.config_path}: {e}")
+
+        if not cfg and os.path.exists("tg_bot_config.json"):
+            try:
+                with open("tg_bot_config.json", "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+            except Exception:
+                pass
+
+        if not cfg:
+            cfg = DEFAULT_TG_CONFIG
+
+        if "characters_path" not in cfg.get("cerberus", {}):
+            cfg.setdefault("cerberus", {})["characters_path"] = "/market/characters"
+        if "characters_monitor" not in cfg.get("strategy", {}):
+            cfg.setdefault("strategy", {})["characters_monitor"] = DEFAULT_TG_CONFIG["strategy"]["characters_monitor"]
+        if "xf_tfa_trust" not in cfg.get("cerberus", {}).get("cookies", {}):
+            cfg.setdefault("cerberus", {}).setdefault("cookies", {})["xf_tfa_trust"] = ""
+
+        # Переменные окружения Bothost
+        env_token = os.environ.get("BOT_TOKEN") or os.environ.get("TELEGRAM_BOT_TOKEN")
+        if env_token:
+            cfg["telegram"]["bot_token"] = env_token.strip()
+
+        for c_key in ["xf_user", "xf_session", "xf_tfa_trust", "cerberus_session"]:
+            val = os.environ.get(c_key.upper()) or os.environ.get(c_key)
+            if val:
+                cfg["cerberus"]["cookies"][c_key] = val.strip()
+
         try:
-            with open(self.config_path, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
-                # Подмешиваем дефолтные секции если отсутствуют
-                if "characters_path" not in cfg.get("cerberus", {}):
-                    cfg.setdefault("cerberus", {})["characters_path"] = "/market/characters"
-                if "characters_monitor" not in cfg.get("strategy", {}):
-                    cfg.setdefault("strategy", {})["characters_monitor"] = DEFAULT_TG_CONFIG["strategy"]["characters_monitor"]
-                return cfg
+            with open(self.config_path, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, indent=2, ensure_ascii=False)
         except Exception:
-            return DEFAULT_TG_CONFIG
+            pass
+
+        return cfg
 
     def _save_config(self):
         try:
             with open(self.config_path, "w", encoding="utf-8") as f:
                 json.dump(self.config, f, indent=2, ensure_ascii=False)
+            if self.config_path != "tg_bot_config.json":
+                try:
+                    with open("tg_bot_config.json", "w", encoding="utf-8") as f:
+                        json.dump(self.config, f, indent=2, ensure_ascii=False)
+                except Exception:
+                    pass
         except Exception as e:
             logger.error(f"Ошибка сохранения конфига: {e}")
 
@@ -174,14 +208,97 @@ class FastTelegramMarketBot:
         limits = httpx.Limits(max_keepalive_connections=15, max_connections=30, keepalive_expiry=60.0)
         timeout = httpx.Timeout(connect=5.0, read=5.0, write=5.0, pool=10.0)
 
+        # ВАЖНО: follow_redirects=False для предотвращения петли редиректов 502
         return httpx.Client(
             http2=True,
             limits=limits,
             timeout=timeout,
             headers=headers,
             cookies=cookies,
-            follow_redirects=True
+            follow_redirects=False
         )
+
+    def reload_cookies(self):
+        self.client.close()
+        self.client = self._init_http2_client()
+        self.warned_2fa = False
+        logger.info("Cookies успешно перезагружены в HTTP/2 клиенте.")
+
+    # --- Безопасный запрос с защитой от бесконечного цикла 2FA ---
+    def fetch_page_safe(self, path: str) -> Tuple[Optional[str], float, int]:
+        c_conf = self.config.get("cerberus", {})
+        base_url = c_conf.get("base_url", "https://cerberus-games.com")
+        url = base_url + path
+
+        t0 = time.perf_counter()
+        current_url = url
+        redirect_count = 0
+
+        try:
+            while redirect_count < 4:
+                resp = self.client.get(current_url)
+
+                # Проверка редиректов (301, 302, 303, 307)
+                if resp.status_code in (301, 302, 303, 307):
+                    location = resp.headers.get("Location", "")
+                    if not location:
+                        break
+
+                    # ОБНАРУЖЕНИЕ ДВУХФАКТОРНОЙ АУТЕНТИФИКАЦИИ (2FA):
+                    if "two-step" in location or "two_step" in location:
+                        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+                        logger.warning(
+                            "🔒 САЙТ ТРЕБУЕТ 2FA (Двухфакторную аутентификацию). "
+                            "Не хватает куки 'xf_tfa_trust' (доверенное устройство)!"
+                        )
+                        self._notify_2fa_required()
+                        return None, elapsed_ms, 303
+
+                    # ОБНАРУЖЕНИЕ СБРОСА СЕССИИ (логин)
+                    if "/login" in location and not ("market" in location or "two-step" in location):
+                        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+                        logger.warning("🔑 Сессия истекла. Требуется обновить куки xf_user и xf_session.")
+                        return None, elapsed_ms, 302
+
+                    if location.startswith("/"):
+                        current_url = base_url + location
+                    else:
+                        current_url = location
+
+                    redirect_count += 1
+                    continue
+
+                # Успешный или конечный ответ
+                elapsed_ms = (time.perf_counter() - t0) * 1000.0
+                return resp.text, elapsed_ms, resp.status_code
+
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            return None, elapsed_ms, 310  # Превышен лимит редиректов
+
+        except Exception as e:
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            logger.error(f"HTTP/2 запрос ({path}) ошибка ({elapsed_ms:.1f} мс): {e}")
+            return None, elapsed_ms, 0
+
+    def _notify_2fa_required(self):
+        if self.warned_2fa:
+            return
+        self.warned_2fa = True
+        admin_id = self.config["telegram"].get("group_chat_id") or self.config["telegram"].get("admin_chat_id")
+        if not admin_id:
+            return
+
+        msg = (
+            "🔒 <b>Внимание: Сервер Cerberus требует 2FA (Двухфакторную аутентификацию)!</b>\n\n"
+            "Поскольку сайт видит новый IP-адрес сервера, он запрашивает подтверждение входа.\n\n"
+            "<b>Как исправить за 1 минуту:</b>\n"
+            "1. Зайдите на сайт в браузере и пройдите 2FA (введите код).\n"
+            "2. Обязательно отметьте галочку <i>«Запомнить это устройство»</i>.\n"
+            "3. В консоли F12 -> Cookies скопируйте куку <b><code>xf_tfa_trust</code></b>.\n"
+            "4. Отправьте боту команду в чат:\n"
+            "<code>/cookies xf_tfa_trust=ВАШЕ_ЗНАЧЕНИЕ</code>"
+        )
+        self.send_message(admin_id, msg)
 
     # --- Telegram API Helpers ---
     def send_message(self, chat_id: int, text: str, reply_markup: Optional[Dict] = None) -> bool:
@@ -194,7 +311,7 @@ class FastTelegramMarketBot:
             r = self.client.post(f"{self.api_url}/sendMessage", json=payload, timeout=5.0)
             return r.status_code == 200
         except Exception as e:
-            logger.error(f"Ошибка отправки сообщения в TG: {e}")
+            logger.error(f"Ошибка отправки TG: {e}")
             return False
 
     def answer_callback(self, callback_query_id: str, text: str = ""):
@@ -204,7 +321,7 @@ class FastTelegramMarketBot:
                 "text": text
             }, timeout=3.0)
         except Exception as e:
-            logger.debug(f"Ошибка ответа на callback: {e}")
+            logger.debug(f"Ошибка callback: {e}")
 
     def get_main_keyboard(self) -> Dict[str, Any]:
         auto_buy_status = "🟢 ВКЛ" if self.config["strategy"]["auto_buy"] else "🔴 ВЫКЛ"
@@ -219,22 +336,7 @@ class FastTelegramMarketBot:
             "resize_keyboard": True
         }
 
-    # --- Запросы страниц рынка и персонажей ---
-    def fetch_page(self, path: str) -> Tuple[Optional[str], float, int]:
-        c_conf = self.config.get("cerberus", {})
-        url = c_conf.get("base_url", "https://cerberus-games.com") + path
-
-        t0 = time.perf_counter()
-        try:
-            resp = self.client.get(url)
-            elapsed_ms = (time.perf_counter() - t0) * 1000.0
-            return resp.text, elapsed_ms, resp.status_code
-        except Exception as e:
-            elapsed_ms = (time.perf_counter() - t0) * 1000.0
-            logger.error(f"HTTP/2 запрос ({path}) ошибка ({elapsed_ms:.1f} мс): {e}")
-            return None, elapsed_ms, 0
-
-    # --- Fast-Check для предметов и персонажей ---
+    # --- Fast-Check ---
     def fast_check_items_changed(self, html: str) -> Tuple[bool, Optional[str]]:
         match = re.search(r'(?:data-lot-id=["\']|details\?s=)(\d+)', html)
         top_id = match.group(1) if match else None
@@ -349,11 +451,9 @@ class FastTelegramMarketBot:
 
                 row_text = r.get_text(" ", strip=True)
 
-                # Никнейм / Название слота
                 nick_el = r.select_one(".name, .char-name, .character-name, .nickname, td.name, strong")
                 nickname = nick_el.get_text(strip=True) if nick_el else f"Персонаж #{char_id}"
 
-                # Цена
                 price_el = r.select_one(".price, .market-price, .cost, td.price")
                 if price_el:
                     raw_price = "".join(ch for ch in price_el.get_text(strip=True) if ch.isdigit() or ch == ".")
@@ -365,7 +465,6 @@ class FastTelegramMarketBot:
                 if price <= 0:
                     continue
 
-                # Уровень
                 level = 1
                 lvl_match = re.search(r'(?:ур\.|lvl|level|уровень)\s*(\d{2})', row_text, re.I)
                 if not lvl_match:
@@ -373,7 +472,6 @@ class FastTelegramMarketBot:
                 if lvl_match:
                     level = int(lvl_match.group(1))
 
-                # Раса
                 race = "Не указана"
                 if any(x in row_text.lower() for x in ["беллато", "bellato", "bcc"]):
                     race = "Беллато (BCC)"
@@ -382,7 +480,6 @@ class FastTelegramMarketBot:
                 elif any(x in row_text.lower() for x in ["акретия", "accretia", "acc"]):
                     race = "Акретия (ACC)"
 
-                # Класс / Профессия
                 char_class = "Общий"
                 for cls_name in ["МАУ", "MAU", "Специалист", "Минёр", "Канонир", "Берсерк", "Паладин", "Варлок", "Маг", "Стрелок", "Ланчер", "Танк", "ББ"]:
                     if cls_name.lower() in row_text.lower():
@@ -404,7 +501,7 @@ class FastTelegramMarketBot:
 
         return characters
 
-    # --- Оценка сделок по предметам ---
+    # --- Оценка сделок ---
     def evaluate_market_deals(self, lots: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         deals = []
         strat = self.config["strategy"]
@@ -450,7 +547,6 @@ class FastTelegramMarketBot:
 
         return deals
 
-    # --- Оценка персонажей ---
     def evaluate_characters_deals(self, chars: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         deals = []
         c_mon = self.config["strategy"].get("characters_monitor", {})
@@ -478,9 +574,9 @@ class FastTelegramMarketBot:
             logger.error(f"Ошибка покупки лота #{lot_id}: {e}")
             return False
 
-    # --- Основной цикл высокоскоростного мониторинга (предметы + персонажи) ---
+    # --- Сканер ---
     def background_speed_scanner(self):
-        logger.info("⚡ Высокоскоростной сканер HTTP/2 запущен (рынок предметов + персонажи).")
+        logger.info("⚡ Высокоскоростной сканер HTTP/2 запущен.")
         strat = self.config["strategy"]
         c_conf = self.config["cerberus"]
 
@@ -490,8 +586,8 @@ class FastTelegramMarketBot:
             tarpit_backoff = strat.get("tarpit_backoff_sec", 1.8)
             cycle += 1
 
-            # 1. Проверка рынка предметов (каждый цикл)
-            html_items, elapsed_ms, status = self.fetch_page(c_conf.get("market_path", "/market"))
+            # 1. Проверка предметов
+            html_items, elapsed_ms, status = self.fetch_page_safe(c_conf.get("market_path", "/market"))
             self.stats["fast_checks_items"] += 1
             self.stats["avg_latency_ms"] = round((self.stats["avg_latency_ms"] * 0.9) + (elapsed_ms * 0.1), 1)
 
@@ -509,10 +605,10 @@ class FastTelegramMarketBot:
                     deals = self.evaluate_market_deals(lots)
                     self._dispatch_item_deals(deals)
 
-            # 2. Проверка биржи персонажей (каждые 3 цикла или при включенном мониторе)
+            # 2. Проверка биржи персонажей (каждые 3 цикла)
             char_mon = strat.get("characters_monitor", {})
             if char_mon.get("enabled", True) and (cycle % 3 == 0):
-                html_chars, el_chars, st_chars = self.fetch_page(c_conf.get("characters_path", "/market/characters"))
+                html_chars, el_chars, st_chars = self.fetch_page_safe(c_conf.get("characters_path", "/market/characters"))
                 self.stats["fast_checks_chars"] += 1
 
                 if html_chars and st_chars == 200:
@@ -636,11 +732,54 @@ class FastTelegramMarketBot:
         if text in ("/start", "/menu"):
             self.send_message(chat_id, "🤖 <b>Cerberus Sniper: Рынок предметов + Персонажи</b>", reply_markup=self.get_main_keyboard())
 
+        elif text.startswith("/cookies") or text.startswith("куки "):
+            raw = text.replace("/cookies", "").replace("куки", "").strip()
+            user_match = re.search(r'xf_user=([^;\s&]+)', raw)
+            sess_match = re.search(r'xf_session=([^;\s&]+)', raw)
+            tfa_match = re.search(r'xf_tfa_trust=([^;\s&]+)', raw)
+            cerb_match = re.search(r'cerberus_session=([^;\s&]+)', raw)
+
+            updated = []
+            if user_match:
+                self.config["cerberus"]["cookies"]["xf_user"] = user_match.group(1)
+                updated.append("xf_user")
+            if sess_match:
+                self.config["cerberus"]["cookies"]["xf_session"] = sess_match.group(1)
+                updated.append("xf_session")
+            if tfa_match:
+                self.config["cerberus"]["cookies"]["xf_tfa_trust"] = tfa_match.group(1)
+                updated.append("xf_tfa_trust")
+            if cerb_match:
+                self.config["cerberus"]["cookies"]["cerberus_session"] = cerb_match.group(1)
+                updated.append("cerberus_session")
+
+            if updated:
+                self._save_config()
+                self.reload_cookies()
+                self.send_message(
+                    chat_id,
+                    f"✅ <b>Cookies успешно обновлены!</b>\n"
+                    f"Обновлено: <code>{', '.join(updated)}</code>\n"
+                    f"Файл: <code>{self.config_path}</code>\n"
+                    f"2FA статус сброшен, продолжаю сканирование..."
+                )
+            else:
+                help_msg = (
+                    "ℹ️ <b>Как передать cookies через чат:</b>\n\n"
+                    "Отправьте команду:\n"
+                    "<code>/cookies xf_user=...; xf_session=...; xf_tfa_trust=...</code>\n\n"
+                    "<i>Если сайт просит 2FA, обязательно передайте xf_tfa_trust!</i>"
+                )
+                self.send_message(chat_id, help_msg)
+
         elif text == "🔍 Сканировать рынок":
             self.send_message(chat_id, "⏳ <i>Мгновенный опрос аукциона через HTTP/2...</i>")
-            html, elapsed_ms, status = self.fetch_page(self.config["cerberus"].get("market_path", "/market"))
-            if not html:
-                self.send_message(chat_id, f"❌ Ошибка соединения (время ответа: {elapsed_ms:.0f} мс)")
+            html, elapsed_ms, status = self.fetch_page_safe(self.config["cerberus"].get("market_path", "/market"))
+            if not html or status != 200:
+                if status == 303:
+                    self.send_message(chat_id, "🔒 <b>Ошибка: Сервер требует 2FA!</b> Добавьте куку <code>xf_tfa_trust</code>.")
+                else:
+                    self.send_message(chat_id, f"❌ Ошибка соединения (код {status}, время: {elapsed_ms:.0f} мс). Проверьте cookies.")
                 return
 
             lots = self._parse_html_lots(html)
@@ -649,7 +788,7 @@ class FastTelegramMarketBot:
                 f"📡 <b>Результат HTTP/2 сканирования:</b>\n"
                 f"• Время ответа: <b>{elapsed_ms:.1f} мс</b>\n"
                 f"• Активных лотов: <b>{len(lots)}</b>\n"
-                f"• Выгодных предложений (выгода $\\ge$ {self.config['strategy'].get('min_profit_cs')} CS): <b>{len(deals)}</b>"
+                f"• Выгодных предложений: <b>{len(deals)}</b>"
             )
             self.send_message(chat_id, res_text)
             for d in deals[:4]:
@@ -659,24 +798,24 @@ class FastTelegramMarketBot:
                 self.send_message(chat_id, card, reply_markup=inline_kb)
 
         elif "Персонажи" in text:
-            # Ручной срез биржи персонажей
             self.send_message(chat_id, "⏳ <i>Сканирую биржу персонажей...</i>")
-            html_ch, el_ch, st_ch = self.fetch_page(self.config["cerberus"].get("characters_path", "/market/characters"))
+            html_ch, el_ch, st_ch = self.fetch_page_safe(self.config["cerberus"].get("characters_path", "/market/characters"))
             if not html_ch or st_ch != 200:
-                self.send_message(chat_id, f"❌ Не удалось загрузить биржу персонажей (статус {st_ch})")
+                if st_ch == 303:
+                    self.send_message(chat_id, "🔒 <b>Ошибка: Сервер требует 2FA!</b> Добавьте куку <code>xf_tfa_trust</code>.")
+                else:
+                    self.send_message(chat_id, f"❌ Не удалось загрузить персонажей (статус {st_ch}). Проверьте cookies.")
                 return
 
             chars = self._parse_html_characters(html_ch)
             char_deals = self.evaluate_characters_deals(chars)
-
             c_mon = self.config["strategy"].get("characters_monitor", {})
             st_msg = (
                 f"👤 <b>Биржа персонажей:</b>\n"
-                f"• Всего персонажей в продаже: <b>{len(chars)}</b>\n"
-                f"• Подходящих под фильтр (ур. $\\ge$ {c_mon.get('min_level')}, цена $\\le$ {c_mon.get('max_price')} CS): <b>{len(char_deals)}</b>"
+                f"• Персонажей в продаже: <b>{len(chars)}</b>\n"
+                f"• Подходящих под фильтр ($\\ge$ {c_mon.get('min_level')} ур.): <b>{len(char_deals)}</b>"
             )
             self.send_message(chat_id, st_msg)
-
             for c in char_deals[:4]:
                 cid = c["char_id"]
                 inline_kb = {
@@ -685,11 +824,7 @@ class FastTelegramMarketBot:
                         [{"text": "🔗 Открыть карточку", "url": c["url"]}]
                     ]
                 }
-                card = (
-                    f"👤 <b>{c['nickname']}</b> ({c['level']} ур.)\n"
-                    f"Раса: <b>{c['race']}</b> | Класс: <b>{c['char_class']}</b>\n"
-                    f"Цена: <b>{c['price']:,.0f} CS</b>"
-                )
+                card = f"👤 <b>{c['nickname']}</b> ({c['level']} ур.)\nРаса: <b>{c['race']}</b> | Класс: <b>{c['char_class']}</b>\nЦена: <b>{c['price']:,.0f} CS</b>"
                 self.send_message(chat_id, card, reply_markup=inline_kb)
 
         elif "Авто-покупка" in text:
@@ -720,11 +855,12 @@ class FastTelegramMarketBot:
         elif text == "📊 Статистика бота":
             st = (
                 f"📊 <b>Статистика Ultra-Fast сессии:</b>\n"
-                f"• Проверок предметов (0.1ms): <b>{self.stats['fast_checks_items']}</b>\n"
+                f"• Хранилище: <code>{self.config_path}</code>\n"
+                f"• Проверок предметов: <b>{self.stats['fast_checks_items']}</b>\n"
                 f"• Проверок персонажей: <b>{self.stats['fast_checks_chars']}</b>\n"
                 f"• Среднее время HTTP/2: <b>{self.stats['avg_latency_ms']} мс</b>\n"
-                f"• Найдено выгодных лотов предметов: <b>{self.stats['deals_found']}</b>\n"
-                f"• Найдено подходящих персонажей: <b>{self.stats['chars_found']}</b>\n"
+                f"• Найдено выгодных лотов: <b>{self.stats['deals_found']}</b>\n"
+                f"• Найдено персонажей: <b>{self.stats['chars_found']}</b>\n"
                 f"• Куплено: <b>{self.stats['purchased']}</b>\n"
                 f"• Авто-выкуп: {'🟢 Активен' if self.config['strategy']['auto_buy'] else '🔴 Остановлен'}"
             )
@@ -735,18 +871,16 @@ class FastTelegramMarketBot:
             c_mon = cfg.get("characters_monitor", {})
             st = (
                 f"⚙️ <b>Параметры снайпера:</b>\n"
+                f"• Конфиг файл: <code>{self.config_path}</code>\n"
                 f"• Пауза опроса: <b>{cfg.get('poll_interval_sec')} сек</b>\n"
-                f"• Мин. выгода на вещах: <b>от {cfg.get('min_profit_cs', 500)} CS</b>\n"
+                f"• Мин. выгода: <b>от {cfg.get('min_profit_cs', 500)} CS</b>\n"
                 f"• Вещи Тип C: <b>только $\\ge$ {cfg.get('min_type_c_level', 40)} ур.</b>\n"
-                f"• Монитор персонажей: <b>{'🟢 Включен' if c_mon.get('enabled') else '🔴 Выключен'}</b>\n"
-                f"• Мин. уровень персонажа: <b>$\\ge$ {c_mon.get('min_level')} ур.</b>\n"
-                f"• Макс. цена персонажа: <b>{c_mon.get('max_price')} CS</b>\n\n"
-                f"<i>Команды для быстрой настройки:</i>\n"
+                f"• Персонажи: <b>{'🟢 Вкл' if c_mon.get('enabled') else '🔴 Выкл'}</b>\n\n"
+                f"<i>Команды:</i>\n"
+                f"• <code>/cookies xf_user=...; xf_session=...; xf_tfa_trust=...</code>\n"
                 f"• <code>персы вкл</code> / <code>персы выкл</code>\n"
-                f"• <code>перс_мин_ур 50</code> — мин. уровень персонажа\n"
-                f"• <code>перс_макс_цена 40000</code> — потолок цены персонажа\n"
-                f"• <code>интервал 0.4</code> — пауза в секундах\n"
-                f"• <code>выгода 500</code> — мин. прибыль в CS"
+                f"• <code>перс_мин_ур 50</code> | <code>перс_макс_цена 40000</code>\n"
+                f"• <code>интервал 0.4</code> | <code>выгода 500</code>"
             )
             self.send_message(chat_id, st)
 
@@ -836,7 +970,7 @@ class FastTelegramMarketBot:
     def run(self):
         if self.token.startswith("YOUR_BOT_TOKEN") or not self.token:
             print("================================================================")
-            print("ОШИБКА: Укажите токен вашего бота в tg_bot_config.json!")
+            print("ОШИБКА: Укажите токен вашего бота в tg_bot_config.json или BOT_TOKEN!")
             print("Получить токен бесплатно можно у официального бота @BotFather")
             print("================================================================")
             return
