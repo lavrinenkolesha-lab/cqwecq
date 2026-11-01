@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """
-Cerberus Games Market Bot - Ultra-Fast HTTP/2 Edition
-=====================================================
-Высокоскоростной Telegram-снайпер и монитор аукциона cerberus-games.com/market.
+Cerberus Games Market Bot - Ultra-Fast HTTP/2 Edition + Characters Scanner
+===========================================================================
+Высокоскоростной Telegram-снайпер и монитор аукциона cerberus-games.com.
 
-Ключевые оптимизации:
-1. HTTP/2 Мультиплексирование (httpx + h2): постоянный защищенный туннель без повторных TLS-рукопожатий.
-   Время ответа сервера сокращено до ~350-450 мс.
-2. Частота опроса ~1 секунда на полный цикл: пауза 0.4 сек между запросами.
-3. Защита от Tarpit-замедлений ServicePipe: автоматический замер времени ответа и плавный backoff.
-4. Ультрабыстрый Fast-Check (0.1 мс): regex-проверка ID верхнего лота без тяжелого парсинга HTML.
-5. Фильтры: вещи Тип C только >= 40 ур., выгода строго от 500 CS, вишлист и отправка в группу/ЛС.
+Ключевые возможности:
+1. Мониторинг предметов (https://cerberus-games.com/market).
+2. Мониторинг биржи персонажей (https://cerberus-games.com/market/characters).
+3. HTTP/2 Мультиплексирование (httpx + h2): время ответа ~350-450 мс.
+4. Ультрабыстрый Fast-Check (0.1 мс): regex-проверка ID без тяжелого DOM-парсинга.
+5. Защита от Tarpit-замедлений ServicePipe с адаптивным backoff.
+6. Фильтры: вещи Тип C >= 40 ур., выгода от 500 CS, персонажи по уровню/классу/цене.
+7. Интерактивные кнопки Telegram (покупка в 1 клик, просмотр карточки на сайте).
 """
 
 import os
@@ -49,6 +50,7 @@ DEFAULT_TG_CONFIG = {
     "cerberus": {
         "base_url": "https://cerberus-games.com",
         "market_path": "/market",
+        "characters_path": "/market/characters",
         "buy_endpoint": "/market/buy",
         "cookies": {
             "xf_user": "",
@@ -74,7 +76,13 @@ DEFAULT_TG_CONFIG = {
             {"name": "Талик Невежества", "max_price": 180},
             {"name": "Талик Покровительства", "max_price": 140},
             {"name": "Руда Т5", "max_price": 15}
-        ]
+        ],
+        "characters_monitor": {
+            "enabled": True,
+            "min_level": 45,
+            "max_price": 60000,
+            "target_classes": ["МАУ", "Специалист", "Минёр", "Канонир", "Берсерк", "Паладин", "Варлок"]
+        }
     }
 }
 
@@ -85,7 +93,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.end_headers()
-        self.wfile.write(b"Cerberus Ultra-Fast Bot is running!")
+        self.wfile.write(b"Cerberus Ultra-Fast Market & Characters Bot is running!")
 
     def log_message(self, format, *args):
         pass
@@ -109,22 +117,30 @@ class FastTelegramMarketBot:
         self.api_url = f"https://api.telegram.org/bot{self.token}"
         self.last_update_id = 0
 
-        # Инициализация HTTP/2 клиента с сохранением пула соединений
+        # Инициализация HTTP/2 клиента
         self.client = self._init_http2_client()
 
         self.running = True
         self.stats = {
-            "fast_checks": 0,
-            "full_parses": 0,
+            "fast_checks_items": 0,
+            "fast_checks_chars": 0,
+            "full_parses_items": 0,
+            "full_parses_chars": 0,
             "deals_found": 0,
+            "chars_found": 0,
             "purchased": 0,
             "total_spent": 0,
             "tarpit_detections": 0,
             "avg_latency_ms": 0.0
         }
-        self.last_top_lot_id: Optional[str] = None
-        self.last_html_hash: Optional[int] = None
+        self.last_top_item_id: Optional[str] = None
+        self.last_items_hash: Optional[int] = None
+
+        self.last_top_char_id: Optional[str] = None
+        self.last_chars_hash: Optional[int] = None
+
         self.seen_lots = set()
+        self.seen_chars = set()
 
     def _load_config(self) -> Dict[str, Any]:
         if not os.path.exists(self.config_path):
@@ -133,7 +149,13 @@ class FastTelegramMarketBot:
             return DEFAULT_TG_CONFIG
         try:
             with open(self.config_path, "r", encoding="utf-8") as f:
-                return json.load(f)
+                cfg = json.load(f)
+                # Подмешиваем дефолтные секции если отсутствуют
+                if "characters_path" not in cfg.get("cerberus", {}):
+                    cfg.setdefault("cerberus", {})["characters_path"] = "/market/characters"
+                if "characters_monitor" not in cfg.get("strategy", {}):
+                    cfg.setdefault("strategy", {})["characters_monitor"] = DEFAULT_TG_CONFIG["strategy"]["characters_monitor"]
+                return cfg
         except Exception:
             return DEFAULT_TG_CONFIG
 
@@ -186,20 +208,21 @@ class FastTelegramMarketBot:
 
     def get_main_keyboard(self) -> Dict[str, Any]:
         auto_buy_status = "🟢 ВКЛ" if self.config["strategy"]["auto_buy"] else "🔴 ВЫКЛ"
+        char_mon = self.config["strategy"].get("characters_monitor", {})
+        chars_status = "🟢 ВКЛ" if char_mon.get("enabled", True) else "🔴 ВЫКЛ"
         return {
             "keyboard": [
-                [{"text": "🔍 Сканировать рынок"}, {"text": f"⚡ Авто-покупка: {auto_buy_status}"}],
-                [{"text": "📋 Мой вишлист"}, {"text": "⚙️ Настройки"}],
-                [{"text": "📊 Статистика бота"}]
+                [{"text": "🔍 Сканировать рынок"}, {"text": f"👤 Персонажи: {chars_status}"}],
+                [{"text": f"⚡ Авто-покупка: {auto_buy_status}"}, {"text": "📋 Мой вишлист"}],
+                [{"text": "⚙️ Настройки"}, {"text": "📊 Статистика бота"}]
             ],
             "resize_keyboard": True
         }
 
-    # --- Оптимизированный Fast-Check и парсинг ---
-    def fetch_market_html(self) -> Tuple[Optional[str], float, int]:
-        """Запрашивает страницу по HTTP/2 и замеряет точное время ответа."""
+    # --- Запросы страниц рынка и персонажей ---
+    def fetch_page(self, path: str) -> Tuple[Optional[str], float, int]:
         c_conf = self.config.get("cerberus", {})
-        url = c_conf.get("base_url", "https://cerberus-games.com") + c_conf.get("market_path", "/market")
+        url = c_conf.get("base_url", "https://cerberus-games.com") + path
 
         t0 = time.perf_counter()
         try:
@@ -208,32 +231,40 @@ class FastTelegramMarketBot:
             return resp.text, elapsed_ms, resp.status_code
         except Exception as e:
             elapsed_ms = (time.perf_counter() - t0) * 1000.0
-            logger.error(f"HTTP/2 запрос завершился ошибкой ({elapsed_ms:.1f} мс): {e}")
+            logger.error(f"HTTP/2 запрос ({path}) ошибка ({elapsed_ms:.1f} мс): {e}")
             return None, elapsed_ms, 0
 
-    def fast_check_changed(self, html: str) -> Tuple[bool, Optional[str]]:
-        """
-        Ультрабыстрый Fast-Check (0.1 мс):
-        Находит ID первого лота в HTML регулярным выражением без построения DOM-дерева BeautifulSoup.
-        """
-        # Ищем data-lot-id или параметр ?s= в ссылках лотов
+    # --- Fast-Check для предметов и персонажей ---
+    def fast_check_items_changed(self, html: str) -> Tuple[bool, Optional[str]]:
         match = re.search(r'(?:data-lot-id=["\']|details\?s=)(\d+)', html)
-        top_lot_id = match.group(1) if match else None
-
-        current_hash = hash(html[:4000])  # Хэш шапки страницы лотов
+        top_id = match.group(1) if match else None
+        current_hash = hash(html[:4000])
 
         is_changed = False
-        if top_lot_id != self.last_top_lot_id:
-            is_changed = True
-        elif current_hash != self.last_html_hash:
+        if top_id != self.last_top_item_id or current_hash != self.last_items_hash:
             is_changed = True
 
-        self.last_top_lot_id = top_lot_id
-        self.last_html_hash = current_hash
-        return is_changed, top_lot_id
+        self.last_top_item_id = top_id
+        self.last_items_hash = current_hash
+        return is_changed, top_id
 
+    def fast_check_characters_changed(self, html: str) -> Tuple[bool, Optional[str]]:
+        match = re.search(r'(?:character=(\d+)|details\?s=(\d+)|data-character-id=["\'](\d+))', html)
+        top_id = None
+        if match:
+            top_id = next(g for g in match.groups() if g is not None)
+        current_hash = hash(html[:4000])
+
+        is_changed = False
+        if top_id != self.last_top_char_id or current_hash != self.last_chars_hash:
+            is_changed = True
+
+        self.last_top_char_id = top_id
+        self.last_chars_hash = current_hash
+        return is_changed, top_id
+
+    # --- Парсинг предметов ---
     def _parse_html_lots(self, html: str) -> List[Dict[str, Any]]:
-        """Детальный парсинг лотов (вызывается только при обнаружении изменений)."""
         soup = BeautifulSoup(html, "html.parser")
         rows = soup.select("tr.market-item, tr.lot, .market-table tbody tr, .market-grid .market-item")
         if not rows:
@@ -269,7 +300,6 @@ class FastTelegramMarketBot:
                     if raw_amount:
                         amount = max(1, int(raw_amount))
 
-                # Извлечение уровня предмета для фильтра Type C
                 level = 1
                 lvl_match = re.search(r'(?:уровень|ур\.|lvl|level)[:\s]*(\d+)', r.get_text(strip=True), re.I)
                 if not lvl_match:
@@ -293,6 +323,88 @@ class FastTelegramMarketBot:
                 continue
         return lots
 
+    # --- Парсинг персонажей ---
+    def _parse_html_characters(self, html: str) -> List[Dict[str, Any]]:
+        soup = BeautifulSoup(html, "html.parser")
+        rows = soup.select(
+            "tr.character-item, tr.lot, .character-card, .market-table tbody tr, table tbody tr, .characters-list tr"
+        )
+
+        characters = []
+        for r in rows:
+            try:
+                char_id = r.get("data-character-id") or r.get("data-id") or r.get("data-lot-id")
+                details = r.select_one("a[href*='character='], a[href*='characters/info'], a[href*='?s=']")
+                char_url = ""
+                if details:
+                    href = details.get("href", "")
+                    char_url = href if href.startswith("http") else ("https://cerberus-games.com" + href)
+                    if "character=" in href:
+                        char_id = href.split("character=")[-1].split("&")[0]
+                    elif "?s=" in href:
+                        char_id = href.split("?s=")[-1].split("&")[0]
+
+                if not char_id:
+                    continue
+
+                row_text = r.get_text(" ", strip=True)
+
+                # Никнейм / Название слота
+                nick_el = r.select_one(".name, .char-name, .character-name, .nickname, td.name, strong")
+                nickname = nick_el.get_text(strip=True) if nick_el else f"Персонаж #{char_id}"
+
+                # Цена
+                price_el = r.select_one(".price, .market-price, .cost, td.price")
+                if price_el:
+                    raw_price = "".join(ch for ch in price_el.get_text(strip=True) if ch.isdigit() or ch == ".")
+                    price = float(raw_price) if raw_price else 0.0
+                else:
+                    price_match = re.search(r'(\d+[\d\s]*)\s*(?:CS|Cash|Шоп)', row_text, re.I)
+                    price = float(price_match.group(1).replace(" ", "")) if price_match else 0.0
+
+                if price <= 0:
+                    continue
+
+                # Уровень
+                level = 1
+                lvl_match = re.search(r'(?:ур\.|lvl|level|уровень)\s*(\d{2})', row_text, re.I)
+                if not lvl_match:
+                    lvl_match = re.search(r'\b(4\d|5\d|6\d)\b', row_text)
+                if lvl_match:
+                    level = int(lvl_match.group(1))
+
+                # Раса
+                race = "Не указана"
+                if any(x in row_text.lower() for x in ["беллато", "bellato", "bcc"]):
+                    race = "Беллато (BCC)"
+                elif any(x in row_text.lower() for x in ["кора", "cora", "ccc"]):
+                    race = "Кора (CCC)"
+                elif any(x in row_text.lower() for x in ["акретия", "accretia", "acc"]):
+                    race = "Акретия (ACC)"
+
+                # Класс / Профессия
+                char_class = "Общий"
+                for cls_name in ["МАУ", "MAU", "Специалист", "Минёр", "Канонир", "Берсерк", "Паладин", "Варлок", "Маг", "Стрелок", "Ланчер", "Танк", "ББ"]:
+                    if cls_name.lower() in row_text.lower():
+                        char_class = cls_name
+                        break
+
+                characters.append({
+                    "char_id": str(char_id),
+                    "nickname": nickname,
+                    "level": level,
+                    "race": race,
+                    "char_class": char_class,
+                    "price": price,
+                    "url": char_url or f"https://cerberus-games.com/market/details?s={char_id}",
+                    "raw_desc": row_text[:120]
+                })
+            except Exception:
+                continue
+
+        return characters
+
+    # --- Оценка сделок по предметам ---
     def evaluate_market_deals(self, lots: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         deals = []
         strat = self.config["strategy"]
@@ -302,14 +414,12 @@ class FastTelegramMarketBot:
         max_lot_price = strat.get("max_price_per_lot", 50000)
         wishlist = strat.get("wishlist", [])
 
-        # Фильтр 1: отсекаем вещи Тип C ниже 40 уровня
         filtered_lots = []
         for l in lots:
             if l["is_type_c"] and l["level"] < min_type_c_lvl:
                 continue
             filtered_lots.append(l)
 
-        # Группировка для поиска относительной выгоды
         groups = {}
         for l in filtered_lots:
             k = l["name"].lower()
@@ -326,12 +436,10 @@ class FastTelegramMarketBot:
                 discount = ((second["unit_price"] - best["unit_price"]) / second["unit_price"]) * 100
                 potential_profit = (second["unit_price"] * 0.95 - best["unit_price"]) * best["amount"]
 
-                # Фильтр 2: Выгода строго от 500 CS и скидка >= min_disc
                 if discount >= min_disc and potential_profit >= min_profit_cs and best["price"] <= max_lot_price:
                     best["reason"] = f"Скидка {discount:.1f}% (+{potential_profit:.0f} CS к следующему)"
                     deals.append(best)
 
-            # Проверка целевого вишлиста
             for l in group:
                 for w in wishlist:
                     if w["name"].lower() in l["name"].lower():
@@ -340,6 +448,22 @@ class FastTelegramMarketBot:
                                 l["reason"] = f"Вишлист (цена {l['unit_price']:.1f} <= {w['max_price']} CS)"
                                 deals.append(l)
 
+        return deals
+
+    # --- Оценка персонажей ---
+    def evaluate_characters_deals(self, chars: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        deals = []
+        c_mon = self.config["strategy"].get("characters_monitor", {})
+        min_lvl = c_mon.get("min_level", 45)
+        max_p = c_mon.get("max_price", 60000)
+        targets = [t.lower() for t in c_mon.get("target_classes", [])]
+
+        for c in chars:
+            if c["level"] >= min_lvl and c["price"] <= max_p:
+                is_target = any(t in c["char_class"].lower() for t in targets) or any(t in c["nickname"].lower() for t in targets)
+                reason = "Целевой класс" if is_target else f"Уровень {c['level']} по выгодной цене"
+                c["reason"] = reason
+                deals.append(c)
         return deals
 
     def execute_buy(self, lot_id: str) -> bool:
@@ -354,95 +478,124 @@ class FastTelegramMarketBot:
             logger.error(f"Ошибка покупки лота #{lot_id}: {e}")
             return False
 
-    # --- Высокоскоростной цикл сканирования с HTTP/2 и защитой Tarpit ---
+    # --- Основной цикл высокоскоростного мониторинга (предметы + персонажи) ---
     def background_speed_scanner(self):
-        logger.info("⚡ Высокоскоростной сканер HTTP/2 запущен (~1 сек цикл).")
+        logger.info("⚡ Высокоскоростной сканер HTTP/2 запущен (рынок предметов + персонажи).")
         strat = self.config["strategy"]
+        c_conf = self.config["cerberus"]
 
+        cycle = 0
         while self.running:
             poll_interval = strat.get("poll_interval_sec", 0.4)
             tarpit_backoff = strat.get("tarpit_backoff_sec", 1.8)
+            cycle += 1
 
-            html, elapsed_ms, status = self.fetch_market_html()
-            self.stats["fast_checks"] += 1
+            # 1. Проверка рынка предметов (каждый цикл)
+            html_items, elapsed_ms, status = self.fetch_page(c_conf.get("market_path", "/market"))
+            self.stats["fast_checks_items"] += 1
+            self.stats["avg_latency_ms"] = round((self.stats["avg_latency_ms"] * 0.9) + (elapsed_ms * 0.1), 1)
 
-            # Скользящее среднее времени ответа
-            self.stats["avg_latency_ms"] = round(
-                (self.stats["avg_latency_ms"] * 0.9) + (elapsed_ms * 0.1), 1
-            )
-
-            # 3. Защита от Tarpit-замедлений ServicePipe:
-            # Если время ответа > 1800 мс или код 429 — защита начинает включать tarpit-задержку
             if elapsed_ms > 1800 or status == 429:
                 self.stats["tarpit_detections"] += 1
-                logger.warning(
-                    f"⚠️ Обнаружен Tarpit/Замедление ({elapsed_ms:.0f} мс, статус {status}). "
-                    f"Включаем адаптивную паузу {tarpit_backoff} сек..."
-                )
+                logger.warning(f"⚠️ ServicePipe Tarpit ({elapsed_ms:.0f} мс). Пауза {tarpit_backoff} сек...")
                 time.sleep(tarpit_backoff)
                 continue
 
-            if not html or status != 200:
-                time.sleep(1.0)
-                continue
+            if html_items and status == 200:
+                changed, _ = self.fast_check_items_changed(html_items)
+                if changed:
+                    self.stats["full_parses_items"] += 1
+                    lots = self._parse_html_lots(html_items)
+                    deals = self.evaluate_market_deals(lots)
+                    self._dispatch_item_deals(deals)
 
-            # 4. Ультрабыстрый Fast-Check (0.1 мс):
-            changed, top_id = self.fast_check_changed(html)
-            if not changed:
-                # Новых лотов нет — моментально переходим к следующему циклу
-                time.sleep(poll_interval)
-                continue
+            # 2. Проверка биржи персонажей (каждые 3 цикла или при включенном мониторе)
+            char_mon = strat.get("characters_monitor", {})
+            if char_mon.get("enabled", True) and (cycle % 3 == 0):
+                html_chars, el_chars, st_chars = self.fetch_page(c_conf.get("characters_path", "/market/characters"))
+                self.stats["fast_checks_chars"] += 1
 
-            # Если рынок изменился — парсим лоты
-            self.stats["full_parses"] += 1
-            lots = self._parse_html_lots(html)
-            deals = self.evaluate_market_deals(lots)
-
-            for deal in deals:
-                lid = deal["lot_id"]
-                if lid in self.seen_lots:
-                    continue
-                self.seen_lots.add(lid)
-                self.stats["deals_found"] += 1
-
-                admin_id = self.config["telegram"].get("group_chat_id") or self.config["telegram"].get("admin_chat_id")
-                if not admin_id:
-                    continue
-
-                if strat.get("auto_buy", False):
-                    success = self.execute_buy(lid)
-                    if success:
-                        self.stats["purchased"] += 1
-                        self.stats["total_spent"] += deal["price"]
-                        msg = (
-                            f"⚡ <b>[АВТОВЫКУП] Лот #{lid} куплен!</b>\n"
-                            f"Предмет: <b>{deal['name']}</b> (x{deal['amount']})\n"
-                            f"Цена: <b>{deal['price']} CS</b>\n"
-                            f"Причина: <i>{deal['reason']}</i>"
-                        )
-                    else:
-                        msg = (
-                            f"⚠️ <b>[ОШИБКА АВТОВЫКУПА] Лот #{lid}</b>\n"
-                            f"Предмет: {deal['name']} за {deal['price']} CS\n"
-                            f"Возможно, лот уже перекупили или истекли cookies."
-                        )
-                    self.send_message(admin_id, msg)
-                else:
-                    inline_kb = {
-                        "inline_keyboard": [
-                            [{"text": f"🛒 Купить #{lid} ({deal['price']} CS)", "callback_data": f"buy_{lid}"}],
-                            [{"text": "🔗 Открыть на сайте", "url": f"https://cerberus-games.com/market/details?s={lid}"}]
-                        ]
-                    }
-                    msg = (
-                        f"🔥 <b>Найден выгодный лот!</b>\n"
-                        f"Предмет: <b>{deal['name']}</b> (x{deal['amount']})\n"
-                        f"Цена: <b>{deal['price']} CS</b> (за ед: {deal['unit_price']:.1f})\n"
-                        f"Выгода: <i>{deal['reason']}</i>"
-                    )
-                    self.send_message(admin_id, msg, reply_markup=inline_kb)
+                if html_chars and st_chars == 200:
+                    ch_changed, _ = self.fast_check_characters_changed(html_chars)
+                    if ch_changed:
+                        self.stats["full_parses_chars"] += 1
+                        chars = self._parse_html_characters(html_chars)
+                        char_deals = self.evaluate_characters_deals(chars)
+                        self._dispatch_char_deals(char_deals)
 
             time.sleep(poll_interval)
+
+    def _dispatch_item_deals(self, deals: List[Dict[str, Any]]):
+        admin_id = self.config["telegram"].get("group_chat_id") or self.config["telegram"].get("admin_chat_id")
+        if not admin_id:
+            return
+
+        for deal in deals:
+            lid = deal["lot_id"]
+            if lid in self.seen_lots:
+                continue
+            self.seen_lots.add(lid)
+            self.stats["deals_found"] += 1
+
+            if self.config["strategy"].get("auto_buy", False):
+                success = self.execute_buy(lid)
+                if success:
+                    self.stats["purchased"] += 1
+                    self.stats["total_spent"] += deal["price"]
+                    msg = (
+                        f"⚡ <b>[АВТОВЫКУП] Лот #{lid} куплен!</b>\n"
+                        f"Предмет: <b>{deal['name']}</b> (x{deal['amount']})\n"
+                        f"Цена: <b>{deal['price']} CS</b>\n"
+                        f"Причина: <i>{deal['reason']}</i>"
+                    )
+                else:
+                    msg = (
+                        f"⚠️ <b>[ОШИБКА АВТОВЫКУПА] Лот #{lid}</b>\n"
+                        f"Предмет: {deal['name']} за {deal['price']} CS"
+                    )
+                self.send_message(admin_id, msg)
+            else:
+                inline_kb = {
+                    "inline_keyboard": [
+                        [{"text": f"🛒 Купить #{lid} ({deal['price']} CS)", "callback_data": f"buy_{lid}"}],
+                        [{"text": "🔗 Открыть лот", "url": f"https://cerberus-games.com/market/details?s={lid}"}]
+                    ]
+                }
+                msg = (
+                    f"🔥 <b>Найден выгодный лот!</b>\n"
+                    f"Предмет: <b>{deal['name']}</b> (x{deal['amount']})\n"
+                    f"Цена: <b>{deal['price']} CS</b> (за ед: {deal['unit_price']:.1f})\n"
+                    f"Выгода: <i>{deal['reason']}</i>"
+                )
+                self.send_message(admin_id, msg, reply_markup=inline_kb)
+
+    def _dispatch_char_deals(self, char_deals: List[Dict[str, Any]]):
+        admin_id = self.config["telegram"].get("group_chat_id") or self.config["telegram"].get("admin_chat_id")
+        if not admin_id:
+            return
+
+        for c in char_deals:
+            cid = c["char_id"]
+            if cid in self.seen_chars:
+                continue
+            self.seen_chars.add(cid)
+            self.stats["chars_found"] += 1
+
+            inline_kb = {
+                "inline_keyboard": [
+                    [{"text": f"🛒 Купить персонажа ({c['price']:,.0f} CS)", "callback_data": f"buy_{cid}"}],
+                    [{"text": "🔗 Открыть карточку", "url": c["url"]}]
+                ]
+            }
+            msg = (
+                f"👤 <b>Новый персонаж на бирже!</b>\n"
+                f"Ник: <b>{c['nickname']}</b>\n"
+                f"Уровень: <b>{c['level']} ур.</b> | Раса: <b>{c['race']}</b>\n"
+                f"Класс: <b>{c['char_class']}</b>\n"
+                f"Цена: <b>{c['price']:,.0f} CS</b>\n"
+                f"Обоснование: <i>{c['reason']}</i>"
+            )
+            self.send_message(admin_id, msg, reply_markup=inline_kb)
 
     # --- Обработка команд в Telegram ---
     def process_single_update(self, update: Dict[str, Any]):
@@ -481,11 +634,11 @@ class FastTelegramMarketBot:
             return
 
         if text in ("/start", "/menu"):
-            self.send_message(chat_id, "🤖 <b>Панель управления Cerberus Ultra-Fast Sniper (HTTP/2)</b>", reply_markup=self.get_main_keyboard())
+            self.send_message(chat_id, "🤖 <b>Cerberus Sniper: Рынок предметов + Персонажи</b>", reply_markup=self.get_main_keyboard())
 
         elif text == "🔍 Сканировать рынок":
             self.send_message(chat_id, "⏳ <i>Мгновенный опрос аукциона через HTTP/2...</i>")
-            html, elapsed_ms, status = self.fetch_market_html()
+            html, elapsed_ms, status = self.fetch_page(self.config["cerberus"].get("market_path", "/market"))
             if not html:
                 self.send_message(chat_id, f"❌ Ошибка соединения (время ответа: {elapsed_ms:.0f} мс)")
                 return
@@ -494,23 +647,48 @@ class FastTelegramMarketBot:
             deals = self.evaluate_market_deals(lots)
             res_text = (
                 f"📡 <b>Результат HTTP/2 сканирования:</b>\n"
-                f"• Время ответа сервера: <b>{elapsed_ms:.1f} мс</b>\n"
-                f"• Всего активных лотов: <b>{len(lots)}</b>\n"
+                f"• Время ответа: <b>{elapsed_ms:.1f} мс</b>\n"
+                f"• Активных лотов: <b>{len(lots)}</b>\n"
                 f"• Выгодных предложений (выгода $\\ge$ {self.config['strategy'].get('min_profit_cs')} CS): <b>{len(deals)}</b>"
             )
             self.send_message(chat_id, res_text)
-
-            for d in deals[:5]:
+            for d in deals[:4]:
                 lid = d["lot_id"]
+                inline_kb = {"inline_keyboard": [[{"text": f"🛒 Купить за {d['price']} CS", "callback_data": f"buy_{lid}"}]]}
+                card = f"🔹 <b>{d['name']}</b> (x{d['amount']})\nЦена: <b>{d['price']} CS</b>\nВыгода: <i>{d['reason']}</i>"
+                self.send_message(chat_id, card, reply_markup=inline_kb)
+
+        elif "Персонажи" in text:
+            # Ручной срез биржи персонажей
+            self.send_message(chat_id, "⏳ <i>Сканирую биржу персонажей...</i>")
+            html_ch, el_ch, st_ch = self.fetch_page(self.config["cerberus"].get("characters_path", "/market/characters"))
+            if not html_ch or st_ch != 200:
+                self.send_message(chat_id, f"❌ Не удалось загрузить биржу персонажей (статус {st_ch})")
+                return
+
+            chars = self._parse_html_characters(html_ch)
+            char_deals = self.evaluate_characters_deals(chars)
+
+            c_mon = self.config["strategy"].get("characters_monitor", {})
+            st_msg = (
+                f"👤 <b>Биржа персонажей:</b>\n"
+                f"• Всего персонажей в продаже: <b>{len(chars)}</b>\n"
+                f"• Подходящих под фильтр (ур. $\\ge$ {c_mon.get('min_level')}, цена $\\le$ {c_mon.get('max_price')} CS): <b>{len(char_deals)}</b>"
+            )
+            self.send_message(chat_id, st_msg)
+
+            for c in char_deals[:4]:
+                cid = c["char_id"]
                 inline_kb = {
                     "inline_keyboard": [
-                        [{"text": f"🛒 Купить за {d['price']} CS", "callback_data": f"buy_{lid}"}]
+                        [{"text": f"🛒 Купить ({c['price']:,.0f} CS)", "callback_data": f"buy_{cid}"}],
+                        [{"text": "🔗 Открыть карточку", "url": c["url"]}]
                     ]
                 }
                 card = (
-                    f"🔹 <b>{d['name']}</b> (x{d['amount']})\n"
-                    f"Цена: <b>{d['price']} CS</b> (за ед: {d['unit_price']:.1f})\n"
-                    f"Выгода: <i>{d['reason']}</i>"
+                    f"👤 <b>{c['nickname']}</b> ({c['level']} ур.)\n"
+                    f"Раса: <b>{c['race']}</b> | Класс: <b>{c['char_class']}</b>\n"
+                    f"Цена: <b>{c['price']:,.0f} CS</b>"
                 )
                 self.send_message(chat_id, card, reply_markup=inline_kb)
 
@@ -541,41 +719,71 @@ class FastTelegramMarketBot:
 
         elif text == "📊 Статистика бота":
             st = (
-                f"📊 <b>Статистика Ultra-Fast HTTP/2 сессии:</b>\n"
-                f"• Быстрых проверок (Fast-Check 0.1ms): <b>{self.stats['fast_checks']}</b>\n"
-                f"• Полных парсингов при обновлении: <b>{self.stats['full_parses']}</b>\n"
-                f"• Среднее время ответа HTTP/2: <b>{self.stats['avg_latency_ms']} мс</b>\n"
-                f"• Срабатываний Tarpit защиты: <b>{self.stats['tarpit_detections']}</b>\n"
-                f"• Найдено выгодных лотов: <b>{self.stats['deals_found']}</b>\n"
-                f"• Куплено лотов: <b>{self.stats['purchased']}</b>\n"
-                f"• Потрачено: <b>{self.stats['total_spent']} CS</b>\n"
+                f"📊 <b>Статистика Ultra-Fast сессии:</b>\n"
+                f"• Проверок предметов (0.1ms): <b>{self.stats['fast_checks_items']}</b>\n"
+                f"• Проверок персонажей: <b>{self.stats['fast_checks_chars']}</b>\n"
+                f"• Среднее время HTTP/2: <b>{self.stats['avg_latency_ms']} мс</b>\n"
+                f"• Найдено выгодных лотов предметов: <b>{self.stats['deals_found']}</b>\n"
+                f"• Найдено подходящих персонажей: <b>{self.stats['chars_found']}</b>\n"
+                f"• Куплено: <b>{self.stats['purchased']}</b>\n"
                 f"• Авто-выкуп: {'🟢 Активен' if self.config['strategy']['auto_buy'] else '🔴 Остановлен'}"
             )
             self.send_message(chat_id, st)
 
         elif text == "⚙️ Настройки":
             cfg = self.config["strategy"]
+            c_mon = cfg.get("characters_monitor", {})
             st = (
-                f"⚙️ <b>Параметры скорости и фильтров:</b>\n"
-                f"• Пауза между проверками: <b>{cfg.get('poll_interval_sec')} сек</b>\n"
-                f"• Мин. выгода: <b>от {cfg.get('min_profit_cs', 500)} CS</b>\n"
+                f"⚙️ <b>Параметры снайпера:</b>\n"
+                f"• Пауза опроса: <b>{cfg.get('poll_interval_sec')} сек</b>\n"
+                f"• Мин. выгода на вещах: <b>от {cfg.get('min_profit_cs', 500)} CS</b>\n"
                 f"• Вещи Тип C: <b>только $\\ge$ {cfg.get('min_type_c_level', 40)} ур.</b>\n"
-                f"• Мин. скидка к конкурентам: <b>{cfg.get('min_discount_pct')}%</b>\n"
-                f"• Макс. цена за 1 лот: <b>{cfg.get('max_price_per_lot')} CS</b>\n\n"
-                f"<i>Команды для изменения настроек прямо в чате:</i>\n"
+                f"• Монитор персонажей: <b>{'🟢 Включен' if c_mon.get('enabled') else '🔴 Выключен'}</b>\n"
+                f"• Мин. уровень персонажа: <b>$\\ge$ {c_mon.get('min_level')} ур.</b>\n"
+                f"• Макс. цена персонажа: <b>{c_mon.get('max_price')} CS</b>\n\n"
+                f"<i>Команды для быстрой настройки:</i>\n"
+                f"• <code>персы вкл</code> / <code>персы выкл</code>\n"
+                f"• <code>перс_мин_ур 50</code> — мин. уровень персонажа\n"
+                f"• <code>перс_макс_цена 40000</code> — потолок цены персонажа\n"
                 f"• <code>интервал 0.4</code> — пауза в секундах\n"
-                f"• <code>выгода 500</code> — мин. прибыль в CS\n"
-                f"• <code>скидка 20</code> — мин. скидка в %\n"
-                f"• <code>макс_цена 5000</code> — лимит цены лота"
+                f"• <code>выгода 500</code> — мин. прибыль в CS"
             )
             self.send_message(chat_id, st)
+
+        elif text.lower() == "персы вкл":
+            self.config["strategy"].setdefault("characters_monitor", {})["enabled"] = True
+            self._save_config()
+            self.send_message(chat_id, "✅ Мониторинг персонажей <b>ВКЛЮЧЕН</b>", reply_markup=self.get_main_keyboard())
+
+        elif text.lower() == "персы выкл":
+            self.config["strategy"].setdefault("characters_monitor", {})["enabled"] = False
+            self._save_config()
+            self.send_message(chat_id, "🔴 Мониторинг персонажей <b>ВЫКЛЮЧЕН</b>", reply_markup=self.get_main_keyboard())
+
+        elif text.lower().startswith("перс_мин_ур "):
+            try:
+                val = int(text.split()[1])
+                self.config["strategy"].setdefault("characters_monitor", {})["min_level"] = val
+                self._save_config()
+                self.send_message(chat_id, f"✅ Мин. уровень персонажей: <b>{val} ур.</b>")
+            except Exception:
+                self.send_message(chat_id, "Пример: <code>перс_мин_ур 50</code>")
+
+        elif text.lower().startswith("перс_макс_цена "):
+            try:
+                val = float(text.split()[1])
+                self.config["strategy"].setdefault("characters_monitor", {})["max_price"] = val
+                self._save_config()
+                self.send_message(chat_id, f"✅ Макс. цена персонажей: <b>{val:,.0f} CS</b>")
+            except Exception:
+                self.send_message(chat_id, "Пример: <code>перс_макс_цена 40000</code>")
 
         elif text.lower().startswith("интервал "):
             try:
                 val = float(text.split()[1])
                 self.config["strategy"]["poll_interval_sec"] = max(0.2, val)
                 self._save_config()
-                self.send_message(chat_id, f"✅ Пауза опроса установлена: <b>{val} сек</b>")
+                self.send_message(chat_id, f"✅ Пауза опроса: <b>{val} сек</b>")
             except Exception:
                 self.send_message(chat_id, "Пример: <code>интервал 0.4</code>")
 
@@ -584,7 +792,7 @@ class FastTelegramMarketBot:
                 val = float(text.split()[1])
                 self.config["strategy"]["min_profit_cs"] = val
                 self._save_config()
-                self.send_message(chat_id, f"✅ Порог выгоды установлен: <b>{val} CS</b>")
+                self.send_message(chat_id, f"✅ Порог выгоды: <b>{val} CS</b>")
             except Exception:
                 self.send_message(chat_id, "Пример: <code>выгода 500</code>")
 
@@ -593,7 +801,7 @@ class FastTelegramMarketBot:
                 val = float(text.split()[1])
                 self.config["strategy"]["min_discount_pct"] = val
                 self._save_config()
-                self.send_message(chat_id, f"✅ Минимальная скидка установлена: <b>{val}%</b>")
+                self.send_message(chat_id, f"✅ Мин. скидка: <b>{val}%</b>")
             except Exception:
                 self.send_message(chat_id, "Пример: <code>скидка 25</code>")
 
@@ -633,15 +841,12 @@ class FastTelegramMarketBot:
             print("================================================================")
             return
 
-        # Запуск фонового HTTP-сервера для Bothost
         http_thread = threading.Thread(target=start_http_health_server, daemon=True)
         http_thread.start()
 
-        # Запуск фонового высокоскоростного сканера
         scanner_thread = threading.Thread(target=self.background_speed_scanner, daemon=True)
         scanner_thread.start()
 
-        # Запуск обработчика Telegram команд
         self.handle_updates()
 
 
